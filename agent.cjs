@@ -261,6 +261,40 @@ function serve() {
 
 const fs2 = require("./firestore.cjs");
 
+const TASK = "Vegas print agent";
+
+/**
+ * Registers the agent to start with Windows, using schtasks rather than
+ * PowerShell — the script policy that blocks .ps1 files does not apply to it,
+ * which is the whole reason this is an .exe.
+ */
+function installTask() {
+  if (!isWindows) return console.error("Only needed on Windows.");
+  const exe = process.execPath;
+  execFile(
+    "schtasks",
+    ["/Create", "/TN", TASK, "/TR", `"${exe}"`, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"],
+    { windowsHide: true },
+    (err, out, errOut) => {
+      if (err) {
+        console.error("Could not register:", String(errOut || err).slice(0, 300));
+        return;
+      }
+      console.log(`Registered. ${TASK} will start when you sign in.`);
+      execFile("schtasks", ["/Run", "/TN", TASK], { windowsHide: true }, () =>
+        console.log("Started. You can close this window."),
+      );
+    },
+  );
+}
+
+function uninstallTask() {
+  if (!isWindows) return console.error("Only needed on Windows.");
+  execFile("schtasks", ["/Delete", "/TN", TASK, "/F"], { windowsHide: true }, (err, out, errOut) =>
+    console.log(err ? `Could not remove: ${String(errOut || err).slice(0, 200)}` : "Removed."),
+  );
+}
+
 function start() {
   log(`Printers: ${JSON.stringify(PRINTERS)}`);
   serve();
@@ -382,6 +416,14 @@ async function sweep(key) {
 
 /* Only run when launched directly, so the slip layout can be exercised from a
    test without the agent connecting to anything. */
-if (require.main === module) start();
+if (require.main === module) {
+  const arg = (process.argv[2] || "").toLowerCase();
+  if (arg === "--install") installTask();
+  else if (arg === "--uninstall") uninstallTask();
+  else {
+    start();
+    if (isWindows) log(`To start with Windows, run once:  "${process.execPath}" --install`);
+  }
+}
 
 module.exports = { render, printRaw };
