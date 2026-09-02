@@ -24,7 +24,15 @@ const CONFIG = readJson(path.join(HERE, "config.json")) || {};
 const KEY_FILE = path.join(HERE, "service-account.json");
 
 /** Which Windows printer each destination maps to. Set in config.json. */
-const PRINTERS = CONFIG.printers || { bar: "", kitchen: "", bill: "" };
+let PRINTERS = CONFIG.printers || { bar: "", kitchen: "", bill: "" };
+
+/** Saves the printer choices beside the exe so they survive a restart. */
+function saveConfig(printers) {
+  PRINTERS = { bar: "", kitchen: "", bill: "", ...printers };
+  const next = { ...CONFIG, printers: PRINTERS };
+  fs.writeFileSync(path.join(HERE, "config.json"), JSON.stringify(next, null, 2));
+  log(`Printers set from the app: ${JSON.stringify(PRINTERS)}`);
+}
 const PORT = CONFIG.port || 9110;
 /** Loopback by default — set "host": "0.0.0.0" in config.json to expose it. */
 const HOST = CONFIG.host || "127.0.0.1";
@@ -226,6 +234,24 @@ function serve() {
         return printRaw(printer, slip, (err, how) =>
           err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how }),
         );
+      }
+
+      /* The office picks printers in the app; this is where that lands, so there
+         is one place to set them rather than a file to edit by hand. */
+      if (url.pathname === "/config" && req.method === "POST") {
+        let body = "";
+        req.on("data", (c) => { body += c; if (body.length > 1e5) req.destroy(); });
+        req.on("end", () => {
+          try {
+            const { printers } = JSON.parse(body);
+            if (!printers || typeof printers !== "object") throw new Error("printers required");
+            saveConfig(printers);
+            reply(res, 200, { ok: true, printers: PRINTERS });
+          } catch (e) {
+            reply(res, 400, { ok: false, error: String(e).slice(0, 200) });
+          }
+        });
+        return;
       }
 
       if (url.pathname === "/print" && req.method === "POST") {
