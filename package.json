@@ -1,0 +1,20 @@
+{
+  "name": "vegas-print-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Prints slips for Vegas Motel & Resto. No dependencies.",
+  "main": "agent.cjs",
+  "scripts": {
+    "start": "node agent.cjs"
+  },
+  "bin": "agent.cjs",
+  "pkg": {
+    "assets": [
+      "config.json"
+    ],
+    "targets": [
+      "node20-win-x64"
+    ],
+    "outputPath": "dist"
+  }
+}

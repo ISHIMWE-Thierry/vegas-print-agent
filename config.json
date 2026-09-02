@@ -1,0 +1,11 @@
+{
+  "_comment": "Put the exact Windows printer names here. See them with: Get-Printer | Select Name",
+  "printers": {
+    "bar": "POS80",
+    "kitchen": "KITCHEN",
+    "bill": "POS80"
+  },
+  "port": 9110,
+  "host": "127.0.0.1",
+  "_host": "set to 0.0.0.0 to let other machines call this agent"
+}
