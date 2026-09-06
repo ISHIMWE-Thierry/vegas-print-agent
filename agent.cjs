@@ -43,6 +43,10 @@ const SWEEP_EVERY = 60 * 1000;
 const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
+/** Shown on the till's Setup page; bump with every release. */
+const VERSION = "1.1.0";
+/** How often the agent tells the house it is alive (agents/<host>). */
+const HEARTBEAT_EVERY = 30 * 1000;
 
 const isWindows = process.platform === "win32";
 const log = (...a) => console.log(new Date().toTimeString().slice(0, 8), ...a);
@@ -217,7 +221,7 @@ function serve() {
       if (req.method === "OPTIONS") return reply(res, 204, {});
 
       if (url.pathname === "/") {
-        return reply(res, 200, { ok: true, service: "vegas-print-agent", platform: process.platform, printers: PRINTERS });
+        return reply(res, 200, { ok: true, service: "vegas-print-agent", version: VERSION, platform: process.platform, printers: PRINTERS });
       }
 
       if (url.pathname === "/printers") {
@@ -337,6 +341,25 @@ function start() {
 
   log(`Queue connected as ${key.client_email}`);
   log(POLL_NOTE);
+
+  /* A heartbeat every half minute, so the office can see from anywhere that
+     this till's printer service is up — without printing a thing. */
+  const host = os.hostname();
+  const beat = () =>
+    listPrinters((names) => {
+      fs2
+        .patch(key, "agents", host, {
+          host, version: VERSION, platform: process.platform,
+          lastSeen: new Date().toISOString(),
+          printers: names.slice(0, 20),
+          mapped: PRINTERS,
+          pid: process.pid,
+        })
+        .catch((e) => log("heartbeat failed:", String(e).slice(0, 120)));
+    });
+  beat();
+  setInterval(beat, HEARTBEAT_EVERY);
+
   let sweepDue = 0;
   const tick = async () => {
     try {
