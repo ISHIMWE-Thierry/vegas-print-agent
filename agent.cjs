@@ -44,7 +44,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -142,34 +142,49 @@ const ESC = 0x1b;
 const GS = 0x1d;
 const money = (n) => Number(n || 0).toLocaleString("en-US");
 
-/** Lays a job out as ESC/POS for an 80mm roll. */
+/**
+ * Lays a job out as ESC/POS for an 80mm roll.
+ *
+ * Everything prints BOLD (ESC E 1 — emphasised mode, universal on ESC/POS
+ * thermal heads): the owner asked for darker, more legible slips (1.2.0).
+ * Item lines and the note are double HEIGHT (GS ! 0x01) — taller but still
+ * the full 42 columns, so nothing wraps; title and total are double width AND
+ * height (GS ! 0x11). Emphasis and size are reset before the cut so the next
+ * job starts clean.
+ */
 function render(job) {
   const out = [];
   const raw = (...b) => out.push(Buffer.from(b));
   const line = (s = "") => out.push(Buffer.from(s + "\n", "latin1"));
 
   raw(ESC, 0x40); // reset
+  raw(ESC, 0x45, 1); // BOLD on — for the whole slip
   raw(ESC, 0x61, 1); // centre
   raw(GS, 0x21, 0x11); // double width + height
   line(job.title || "VEGAS");
-  raw(GS, 0x21, 0x00); // normal
+  raw(GS, 0x21, 0x01); // double height
   line(`${(job.venue || "").toUpperCase()}  ${job.at || ""}`);
   if (job.who) line(job.who);
+  raw(GS, 0x21, 0x00); // normal size (still bold)
   raw(ESC, 0x61, 0); // left
-  line("-".repeat(42));
+  line("=".repeat(42));
 
+  raw(GS, 0x21, 0x01); // items: double height, full 42 columns
   (job.lines || []).forEach((l) => {
     const left = `${l.qty} x ${l.name}`.slice(0, 28);
     const right = money(l.total);
     line(left + " ".repeat(Math.max(1, 42 - left.length - right.length)) + right);
   });
-
-  line("-".repeat(42));
-  raw(GS, 0x21, 0x01); // double height
-  const total = `TOTAL ${money(job.total)} RWF`;
-  line(total);
   raw(GS, 0x21, 0x00);
+
+  line("=".repeat(42));
+  raw(GS, 0x21, 0x11); // total: double width + height
+  line(`TOTAL ${money(job.total)}`);
+  raw(GS, 0x21, 0x01);
+  line("RWF");
   if (job.note) line(job.note);
+  raw(GS, 0x21, 0x00);
+  raw(ESC, 0x45, 0); // bold off
   line();
   line();
   raw(GS, 0x56, 0x00); // cut
