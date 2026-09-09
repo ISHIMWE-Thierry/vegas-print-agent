@@ -9,6 +9,10 @@
  * reconnects on its own) and a printer that refuses raw bytes (falls back to
  * plain text rather than leaving the counter with nothing).
  *
+ * The slip layout lives in slipLayout.cjs, shared with the website: the app
+ * renders the bytes for every slip it sends, so the paper changes with a
+ * deploy, not with a new exe.
+ *
  *   node agent.cjs
  */
 const { execFile } = require("child_process");
@@ -44,7 +48,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -121,6 +125,7 @@ $written = 0
       .readFileSync(file)
       .toString("latin1")
       .replace(/\x1b./g, "")
+      .replace(/\x1c./g, "")
       .replace(/\x1d./g, "")
       .replace(/[\x00-\x08\x0b-\x1f]/g, "");
     const txtFile = file + ".txt";
@@ -138,57 +143,16 @@ $written = 0
 
 /* ------------------------------------------------------------------- the slip */
 
-const ESC = 0x1b;
-const GS = 0x1d;
-const money = (n) => Number(n || 0).toLocaleString("en-US");
+const { escposBytes, sample } = require("./slipLayout.cjs");
 
 /**
- * Lays a job out as ESC/POS for an 80mm roll.
- *
- * Everything prints BOLD (ESC E 1 — emphasised mode, universal on ESC/POS
- * thermal heads): the owner asked for darker, more legible slips (1.2.0).
- * Item lines and the note are double HEIGHT (GS ! 0x01) — taller but still
- * the full 42 columns, so nothing wraps; title and total are double width AND
- * height (GS ! 0x11). Emphasis and size are reset before the cut so the next
- * job starts clean.
+ * Lays a job out as ESC/POS. The layout is slipLayout.cjs, the same file the
+ * website uses: the app renders the bytes for every slip it sends (queued jobs
+ * carry them as `base64`), so this only serves /selftest, jobs queued by an
+ * older app, and anything else that POSTs a slip here.
  */
 function render(job) {
-  const out = [];
-  const raw = (...b) => out.push(Buffer.from(b));
-  const line = (s = "") => out.push(Buffer.from(s + "\n", "latin1"));
-
-  raw(ESC, 0x40); // reset
-  raw(ESC, 0x45, 1); // BOLD on — for the whole slip
-  raw(ESC, 0x61, 1); // centre
-  raw(GS, 0x21, 0x11); // double width + height
-  line(job.title || "VEGAS");
-  raw(GS, 0x21, 0x01); // double height
-  line(`${(job.venue || "").toUpperCase()}  ${job.at || ""}`);
-  if (job.who) line(job.who);
-  raw(GS, 0x21, 0x00); // normal size (still bold)
-  raw(ESC, 0x61, 0); // left
-  line("=".repeat(42));
-
-  raw(GS, 0x21, 0x01); // items: double height, full 42 columns
-  (job.lines || []).forEach((l) => {
-    const left = `${l.qty} x ${l.name}`.slice(0, 28);
-    const right = money(l.total);
-    line(left + " ".repeat(Math.max(1, 42 - left.length - right.length)) + right);
-  });
-  raw(GS, 0x21, 0x00);
-
-  line("=".repeat(42));
-  raw(GS, 0x21, 0x11); // total: double width + height
-  line(`TOTAL ${money(job.total)}`);
-  raw(GS, 0x21, 0x01);
-  line("RWF");
-  if (job.note) line(job.note);
-  raw(GS, 0x21, 0x00);
-  raw(ESC, 0x45, 0); // bold off
-  line();
-  line();
-  raw(GS, 0x56, 0x00); // cut
-  return Buffer.concat(out);
+  return Buffer.from(escposBytes(job));
 }
 
 
@@ -246,10 +210,8 @@ function serve() {
       if (url.pathname === "/selftest") {
         const printer = url.searchParams.get("printer") || PRINTERS.bill;
         if (!printer) return reply(res, 400, { ok: false, error: "use /selftest?printer=NAME" });
-        const slip = render({
-          title: "TEST SLIP", venue: "vegas", who: "print agent", at: new Date().toTimeString().slice(0, 5),
-          lines: [{ name: "If you can read this", qty: 1, total: 0 }], total: 0, note: "IT WORKS",
-        });
+        // The owner's sample bill, so what comes out is what a real bill looks like.
+        const slip = render(sample());
         return printRaw(printer, slip, (err, how) =>
           err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how }),
         );
@@ -415,7 +377,12 @@ async function handle(key, job) {
   );
   if (!claimed) return;
 
-  printRaw(printer, render(job.data), async (err, how) => {
+  /* The app lays the slip out and sends the bytes along; a job from an older app
+     carries none and is laid out here instead. */
+  const bytes = typeof job.data.base64 === "string" && job.data.base64
+    ? Buffer.from(job.data.base64, "base64")
+    : render(job.data);
+  printRaw(printer, bytes, async (err, how) => {
     try {
       if (err) {
         const done = attempts >= MAX_ATTEMPTS;
