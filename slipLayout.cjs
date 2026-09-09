@@ -19,7 +19,10 @@ const BUSINESS = {
   tagline: "BAR & RESTAURANT",
   phone: "0785601615",
   tin: "146163522",
-  momo: "0676708 / VEGAS INVESTMENT",
+  /* The number customers pay to. The house can change it from Setup (after a
+     Telegram code); the app then passes it on each bill as `momo`. */
+  momoNumber: "0676708",
+  momoName: "VEGAS INVESTMENT",
   thanks: "*** Thanks ***",
   bye: "Welcome again",
 };
@@ -37,6 +40,7 @@ const BUSINESS = {
  *   lines: SlipLine[];
  *   total: number;
  *   note?: string;
+ *   momo?: string;
  * }} Slip
  */
 
@@ -126,7 +130,7 @@ function bill(o, s) {
   o.line();
   o.line(`PHONE: ${BUSINESS.phone}`);
   o.line(`TIN: ${BUSINESS.tin}`);
-  o.line(`MOMO PAY: ${BUSINESS.momo}`);
+  o.line(`MOMO PAY: ${s.momo || `${BUSINESS.momoNumber} / ${BUSINESS.momoName}`}`);
   o.line();
   o.line("*****");
   o.size(0x01); o.line("CUSTOMER BILL");
