@@ -15,7 +15,8 @@
  *
  *   node agent.cjs
  */
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
+const https = require("https");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -48,7 +49,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -69,7 +70,10 @@ const ps = (script, cb) =>
   execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, cb);
 
 /** Push bytes to the spooler untouched, so ESC/POS sizing and the cutter work. */
-function printRaw(printer, bytes, cb) {
+let inFlight = 0;
+function printRaw(printer, bytes, done) {
+  inFlight += 1;
+  const cb = (err, how) => { inFlight = Math.max(0, inFlight - 1); done(err, how); };
   const file = path.join(os.tmpdir(), `vegas-${Date.now()}.bin`);
   fs.writeFileSync(file, bytes);
 
@@ -261,7 +265,94 @@ function serve() {
 
       reply(res, 404, { ok: false, error: "not found" });
     })
-    .listen(PORT, HOST, () => log(`API on http://${HOST}:${PORT}`));
+    .listen(PORT, HOST, () => {
+      log(`API on http://${HOST}:${PORT}`);
+      // Tells an update in progress that this version came up fine.
+      try { fs.writeFileSync(MARKER, `${VERSION} ${new Date().toISOString()}`); } catch { /* not fatal */ }
+    });
+}
+
+/* ------------------------------------------------------------- self-update */
+/**
+ * The till keeps itself current. Every few hours the agent asks GitHub for
+ * the latest release; a newer VegasPrint.exe is downloaded next to this one,
+ * checked, and swapped in by a small script once no slip is printing. The
+ * script starts the new exe and, if it has not come up within half a minute,
+ * puts the old one back — so an update can never leave the bar without a printer.
+ */
+const RELEASE_API = "https://api.github.com/repos/ISHIMWE-Thierry/vegas-print-agent/releases/latest";
+const RELEASE_EXE = "https://github.com/ISHIMWE-Thierry/vegas-print-agent/releases/latest/download/VegasPrint.exe";
+const UPDATE_EVERY = 6 * 60 * 60 * 1000;
+const IS_EXE = isWindows && /\.exe$/i.test(process.execPath) && !/node\.exe$/i.test(process.execPath);
+const MARKER = path.join(HERE, "started.txt");
+
+const fetchUrl = (url, hops = 0) =>
+  new Promise((resolve, reject) => {
+    if (hops > 6) return reject(new Error("too many redirects"));
+    https.get(url, { headers: { "User-Agent": `VegasPrint/${VERSION}`, Accept: "*/*" } }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        return resolve(fetchUrl(new URL(res.headers.location, url).href, hops + 1));
+      }
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)); }
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+
+const semver = (v) => String(v || "").replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+const newer = (a, b) => { const x = semver(a), y = semver(b); for (let i = 0; i < 3; i++) { if ((x[i] || 0) > (y[i] || 0)) return true; if ((x[i] || 0) < (y[i] || 0)) return false; } return false; };
+
+async function checkUpdate() {
+  if (!IS_EXE) return;
+  let latest;
+  try {
+    latest = JSON.parse((await fetchUrl(RELEASE_API)).toString("utf8")).tag_name;
+  } catch (e) {
+    log("update check failed:", String(e).slice(0, 120));
+    return;
+  }
+  if (!newer(latest, VERSION)) return;
+  if (inFlight > 0) { log(`update ${latest} waits — a slip is printing`); setTimeout(() => void checkUpdate(), 60 * 1000); return; }
+  log(`update: ${VERSION} -> ${latest}, downloading`);
+  const exe = process.execPath;
+  const fresh = path.join(HERE, "VegasPrint.new.exe");
+  const old = path.join(HERE, "VegasPrint.old.exe");
+  try {
+    const body = await fetchUrl(RELEASE_EXE);
+    if (body.length < 20 * 1024 * 1024 || body[0] !== 0x4d || body[1] !== 0x5a) throw new Error(`download does not look like the exe (${body.length} bytes)`);
+    fs.writeFileSync(fresh, body);
+  } catch (e) {
+    log("update download failed:", String(e).slice(0, 160));
+    return;
+  }
+  /* Plain ASCII, one line per step: the till's PowerShell policy blocks .ps1, cmd is always there. */
+  const script = [
+    "@echo off",
+    "setlocal",
+    "ping -n 4 127.0.0.1 >nul",
+    `if exist "${old}" del /f /q "${old}"`,
+    `move /y "${exe}" "${old}" >nul || exit /b 1`,
+    `move /y "${fresh}" "${exe}" >nul || (move /y "${old}" "${exe}" >nul & exit /b 1)`,
+    `if exist "${MARKER}" del /f /q "${MARKER}"`,
+    `schtasks /Run /TN "${TASK}" >nul 2>&1 || start "" "${exe}"`,
+    "ping -n 31 127.0.0.1 >nul",
+    `if not exist "${MARKER}" (`,
+    `  taskkill /f /im "${path.basename(exe)}" >nul 2>&1`,
+    `  move /y "${old}" "${exe}" >nul`,
+    `  schtasks /Run /TN "${TASK}" >nul 2>&1 || start "" "${exe}"`,
+    ")",
+    'del "%~f0"',
+    "",
+  ].join("\r\n");
+  const cmdFile = path.join(HERE, "update.cmd");
+  fs.writeFileSync(cmdFile, script, "ascii");
+  log(`update: swapping in ${latest} and restarting`);
+  const child = spawn("cmd.exe", ["/c", cmdFile], { detached: true, stdio: "ignore", windowsHide: true, cwd: HERE });
+  child.unref();
+  setTimeout(() => process.exit(0), 1500);
 }
 
 /* ------------------------------------------------------------------ the queue */
@@ -352,6 +443,10 @@ function start() {
   };
   void tick();
   setInterval(() => void tick(), POLL_EVERY);
+
+  /* Keep the till current: a minute after start, then every few hours. */
+  setTimeout(() => void checkUpdate(), 60 * 1000);
+  setInterval(() => void checkUpdate(), UPDATE_EVERY);
 }
 
 async function handle(key, job) {

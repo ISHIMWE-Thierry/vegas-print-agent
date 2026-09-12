@@ -44,19 +44,24 @@ const BUSINESS = {
  * }} Slip
  */
 
+const { HEADER_RASTER } = require("./headerBits.cjs");
+
 const ESC = 0x1b;
 const GS = 0x1d;
-const FS = 0x1c;
 
-/** Columns on an 80 mm roll in font A. Double width halves it. */
+/** Columns on an 80 mm roll in font A, as the old till used them. Double width halves it. */
 const WIDTH = 42;
 const WIDE = WIDTH / 2;
-const NAME_W = 26;
-const QTY_W = 6;
-const TOTAL_W = WIDTH - NAME_W - QTY_W;
+/* The old bill's columns: the name on its own line, then the quantity ending
+   under "Qty" and the amount flush right under "Total". */
+const ITEM_W = 22;
+const QTY_W = 5;
+const TOTAL_W = WIDTH - ITEM_W - QTY_W;
+/** Where the time sits on the date line — not flush right, as on the old bill. */
+const TIME_AT = 24;
 
-/** 4200 → "4,200". No locale involved, so the exe and the browser agree. */
-const money = (n) => String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+/** 4200 → "4200", the way the old till wrote money. No locale, so the exe and the browser agree. */
+const money = (n) => String(Math.round(Number(n) || 0));
 const padR = (s, w) => (s.length >= w ? s.slice(0, w) : s + " ".repeat(w - s.length));
 const padL = (s, w) => (s.length >= w ? s : " ".repeat(w - s.length) + s);
 
@@ -89,65 +94,59 @@ function writer() {
     /** 0 normal · 0x01 double height · 0x11 double width and height */
     size: (n) => raw(GS, 0x21, n),
     bold: (on) => raw(ESC, 0x45, on ? 1 : 0),
+    /** Double-strike: every dot burnt twice. On thermal heads this is the darkest text there is. */
+    strike: (on) => raw(ESC, 0x47, on ? 1 : 0),
+    /** Print density for this job: GS ( K fn 50, +6 steps (about 130 %). A head that
+     *  does not know the function skips it — the length bytes see to that. */
+    dark: () => raw(GS, 0x28, 0x4b, 0x02, 0x00, 0x32, 0x06),
+    /** Artwork (GS v 0 raster) from base64 — atob is in every browser and in node. */
+    image: (b64) => { const bin = atob(b64); for (let i = 0; i < bin.length; i++) bytes.push(bin.charCodeAt(i)); },
     rule: (ch = "-") => line(ch.repeat(WIDTH)),
   };
 }
 
-/** One item on a line — name, quantity, total. A long name takes a line of its own. */
-function rows(name, qty, total) {
-  const nums = padL(qty, QTY_W) + padL(total, TOTAL_W);
-  if (name.length <= NAME_W) return [padR(name, NAME_W) + nums];
-  return [name.slice(0, WIDTH), " ".repeat(NAME_W) + nums];
-}
-
+/** The table the old till printed: a name line, then the quantity and amount on the next. */
 function itemTable(o, lines) {
   o.size(0);
   o.rule();
-  o.line(padR("Item", NAME_W) + padL("Qty", QTY_W) + padL("Total", TOTAL_W));
+  o.line(padR("Item", ITEM_W) + padL("Qty", QTY_W) + padL("Total", TOTAL_W));
   o.rule();
-  o.size(0x01); // taller rows, still the full 42 columns
   for (const l of lines || []) {
-    for (const r of rows(ascii(l.name), String(l.qty ?? ""), money(l.total))) o.line(r);
+    o.line(ascii(l.name).slice(0, WIDTH));
+    o.line(" ".repeat(ITEM_W) + padL(String(l.qty ?? ""), QTY_W) + padL(money(l.total), TOTAL_W));
   }
-  o.size(0);
   o.rule();
 }
 
 function totalLine(o, total) {
-  const amt = `${money(total)} RWF`;
-  o.size(0x11);
-  o.line(padR("TOTAL", Math.max(6, WIDE - amt.length)) + amt);
-  o.size(0);
+  o.line(padL("TOTAL", ITEM_W + QTY_W) + padL(money(total), TOTAL_W));
+  o.rule();
 }
 
-/** The customer's bill, laid out like the slip the old till printed. */
+/** The customer's bill, line for line the slip the old till printed. */
 function bill(o, s) {
   o.centre();
-  o.raw(FS, 0x70, 1, 0); // the logo, if one is stored in the printer's memory (ignored otherwise)
-  o.size(0x11); o.line(BUSINESS.name);
-  o.size(0x01); o.line(BUSINESS.tagline);
-  o.size(0);
+  o.image(HEADER_RASTER); // the VG mark, VEGAS MOTEL, BAR & RESTAURANT — as artwork, so it prints heavy
   o.line();
-  o.line(`PHONE: ${BUSINESS.phone}`);
-  o.line(`TIN: ${BUSINESS.tin}`);
-  o.line(`MOMO PAY: ${s.momo || `${BUSINESS.momoNumber} / ${BUSINESS.momoName}`}`);
+  o.line(`PHONE:${BUSINESS.phone}`);
+  o.line(`TIN:${BUSINESS.tin}`);
+  o.line(`MOMO PAY: ${s.momo || `${BUSINESS.momoNumber} /${BUSINESS.momoName}`}`);
   o.line();
   o.line("*****");
-  o.size(0x01); o.line("CUSTOMER BILL");
-  o.size(0); o.line("Not Official Receipt");
+  o.line("CUSTOMER BILL");
+  o.line("Not Official Receipt");
   o.left();
+  o.line();
   itemTable(o, s.lines);
   totalLine(o, s.total);
-  o.rule();
-  o.line();
-  o.size(0x01); o.line(s.table ? `Table: ${s.table}` : s.title || ""); o.size(0);
-  if (s.who) o.line(`Served by: ${s.who}`);
-  if (s.note) o.line(`Status: ${s.note}`);
-  o.line();
+  o.line(); o.line();
+  o.line(`Table: ${s.table ? `Table ${s.table}` : s.title || ""}`);
+  if (s.who) o.line(`Served by:${s.who}`);
+  o.line(); o.line(); o.line();
   o.centre(); o.line(BUSINESS.thanks);
   o.left();
-  const at = s.at || "";
-  o.line(padR(s.date || "", WIDTH - at.length) + at);
+  o.line();
+  o.line(padR(s.date || "", TIME_AT) + (s.at || ""));
   o.rule("*");
   o.centre(); o.line(BUSINESS.bye);
 }
@@ -162,25 +161,30 @@ function copy(o, s) {
   if (meta) o.line(meta);
   if (s.who) o.line(s.who);
   o.left();
+  o.line();
   itemTable(o, s.lines);
   totalLine(o, s.total);
-  o.rule();
 }
 
 /**
- * ESC/POS for one slip. Everything is bold (ESC E 1 — the owner wants dark,
- * legible print); item rows are double height, the name and the total double
- * width too. Size and emphasis are reset before the cut so the next job starts clean.
+ * ESC/POS for one slip. Everything is bold and double-struck (ESC E, ESC G) and
+ * the job asks the head for a darker burn (GS ( K) — the owner's bills came out
+ * thin. The bill opens with the artwork header; the rest is the printer's own
+ * font A, 42 columns, laid out like the old till's slip. Size and emphasis are
+ * reset before the cut so the next job starts clean.
  * @param {Slip} slip
  * @returns {Uint8Array}
  */
 function escposBytes(slip) {
   const o = writer();
   o.raw(ESC, 0x40); // reset
+  o.dark();         // burn darker for this job — the owner's heads print thin at their default
   o.bold(true);
+  o.strike(true);
   if (slip.to === "bill") bill(o, slip);
   else copy(o, slip);
   o.size(0);
+  o.strike(false);
   o.bold(false);
   o.line(); o.line(); o.line();
   o.raw(GS, 0x56, 0x00); // full cut
@@ -194,4 +198,7 @@ const sample = (now = new Date()) => ({
   total: 4200, note: "TO PAY",
 });
 
-module.exports = { escposBytes, BUSINESS, WIDTH, ascii, money, slipDate, slipTime, sample };
+/** The agent version the app was released with; Setup warns a till running an older one. */
+const AGENT_LATEST = "1.4.0";
+
+module.exports = { escposBytes, BUSINESS, WIDTH, ascii, money, slipDate, slipTime, sample, AGENT_LATEST };
