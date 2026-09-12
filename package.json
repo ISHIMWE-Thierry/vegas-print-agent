@@ -1,6 +1,6 @@
 {
   "name": "vegas-print-agent",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "description": "Prints slips for Vegas Motel & Resto. No dependencies.",
   "main": "agent.cjs",

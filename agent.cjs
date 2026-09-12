@@ -49,7 +49,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -68,6 +68,42 @@ function readJson(p) {
 
 const ps = (script, cb) =>
   execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, cb);
+
+/**
+ * The words of a slip with every ESC/POS command taken out — including the
+ * ones that carry data, a raster (GS v 0) or a settings block (GS ( x), which
+ * a plain regex would leave behind as thousands of stray characters.
+ */
+function stripEscPos(buf) {
+  const out = [];
+  for (let i = 0; i < buf.length; i++) {
+    const b = buf[i];
+    if (b === 0x1b) {
+      const c = buf[i + 1];
+      if (c === 0x40) i += 1;                 // ESC @
+      else if (c === 0x37) i += 4;            // ESC 7 n1 n2 n3
+      else if (c === 0x2a) {                  // ESC * m nL nH data
+        const m = buf[i + 2], n = buf[i + 3] | (buf[i + 4] << 8);
+        i += 4 + n * (m >= 32 ? 3 : 1);
+      } else i += 2;                          // ESC x n
+      continue;
+    }
+    if (b === 0x1d) {
+      const c = buf[i + 1];
+      if (c === 0x76 && buf[i + 2] === 0x30) { // GS v 0 m xL xH yL yH data
+        const w = buf[i + 4] | (buf[i + 5] << 8), h = buf[i + 6] | (buf[i + 7] << 8);
+        i += 7 + w * h;
+      } else if (c === 0x28) {                // GS ( x pL pH payload
+        i += 4 + (buf[i + 3] | (buf[i + 4] << 8));
+      } else if (c === 0x56) i += buf[i + 2] >= 65 ? 3 : 2; // GS V m [n]
+      else i += 2;                            // GS x n
+      continue;
+    }
+    if (b === 0x1c) { i += buf[i + 1] === 0x70 ? 3 : 2; continue; } // FS p n m · FS x n
+    if (b === 0x0a || (b >= 0x20 && b < 0x7f)) out.push(b);
+  }
+  return Buffer.from(out).toString("latin1");
+}
 
 /** Push bytes to the spooler untouched, so ESC/POS sizing and the cutter work. */
 let inFlight = 0;
@@ -124,14 +160,9 @@ $written = 0
       return cb(null, "raw");
     }
     // A driver that refuses RAW should not mean no paper. Same slip, plain text:
-    // no big type and no auto-cut, but the barman still has something to pour from.
-    const text = fs
-      .readFileSync(file)
-      .toString("latin1")
-      .replace(/\x1b./g, "")
-      .replace(/\x1c./g, "")
-      .replace(/\x1d./g, "")
-      .replace(/[\x00-\x08\x0b-\x1f]/g, "");
+    // no big type, no artwork and no auto-cut, but the barman still has
+    // something to pour from — and never a metre of picture bytes as letters.
+    const text = stripEscPos(fs.readFileSync(file));
     const txtFile = file + ".txt";
     fs.writeFileSync(txtFile, text, "latin1");
     ps(
@@ -215,7 +246,11 @@ function serve() {
         const printer = url.searchParams.get("printer") || PRINTERS.bill;
         if (!printer) return reply(res, 400, { ok: false, error: "use /selftest?printer=NAME" });
         // The owner's sample bill, so what comes out is what a real bill looks like.
-        const slip = render(sample());
+        // ?art=1 adds the artwork header and the darker burn; ?test=1 prints the test slip.
+        const art = url.searchParams.get("art") === "1";
+        const slip = url.searchParams.get("test") === "1"
+          ? Buffer.from(escposBytes({ to: "test", lines: [], total: 0 }))
+          : Buffer.from(escposBytes(sample(), { art }));
         return printRaw(printer, slip, (err, how) =>
           err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how }),
         );
@@ -552,4 +587,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { render, printRaw };
+module.exports = { render, printRaw, stripEscPos };

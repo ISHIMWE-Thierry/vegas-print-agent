@@ -30,7 +30,7 @@ const BUSINESS = {
 /**
  * @typedef {{ name: string; qty: number; total: number }} SlipLine
  * @typedef {{
- *   to?: string;
+ *   to?: string; // "bill" · "bar" · "kitchen" · "test"
  *   title?: string;
  *   venue?: string;
  *   who?: string;
@@ -124,9 +124,16 @@ function totalLine(o, total) {
 }
 
 /** The customer's bill, line for line the slip the old till printed. */
-function bill(o, s) {
+function bill(o, s, art) {
   o.centre();
-  o.image(HEADER_RASTER); // the VG mark, VEGAS MOTEL, BAR & RESTAURANT — as artwork, so it prints heavy
+  if (art) {
+    o.image(HEADER_RASTER); // the VG mark, VEGAS MOTEL, BAR & RESTAURANT — as artwork, so it prints heavy
+  } else {
+    // Until the till has proved it prints artwork, the name in the head's own big type.
+    o.size(0x11); o.line(BUSINESS.name);
+    o.size(0x01); o.line(BUSINESS.tagline);
+    o.size(0);
+  }
   o.line();
   o.line(`PHONE:${BUSINESS.phone}`);
   o.line(`TIN:${BUSINESS.tin}`);
@@ -166,22 +173,61 @@ function copy(o, s) {
   totalLine(o, s.total);
 }
 
+/** A black bar, 576 x 16 dots: the smallest artwork that shows whether a head takes rasters. */
+const TEST_BAR = (() => {
+  const rows = 16, perRow = 72;
+  const b = [GS, 0x76, 0x30, 0x00, perRow & 0xff, perRow >> 8, rows & 0xff, rows >> 8];
+  for (let i = 0; i < rows * perRow; i++) b.push(0xff);
+  return b;
+})();
+
 /**
- * ESC/POS for one slip. Everything is bold and double-struck (ESC E, ESC G) and
- * the job asks the head for a darker burn (GS ( K) — the owner's bills came out
- * thin. The bill opens with the artwork header; the rest is the printer's own
- * font A, 42 columns, laid out like the old till's slip. Size and emphasis are
- * reset before the cut so the next job starts clean.
+ * The test slip the office prints from Setup before switching artwork on. It
+ * is short on purpose: if the head cannot take a raster, sixteen rows of a
+ * black bar come out as a few lines of stray characters — not a metre of them.
+ */
+function testSlip(o) {
+  o.centre();
+  o.size(0x11); o.line("PRINT TEST"); o.size(0);
+  o.line(`${BUSINESS.name} - ${slipDate()} ${slipTime()}`);
+  o.line();
+  o.left();
+  o.line("1. A black bar should print here:");
+  o.raw(...TEST_BAR);
+  o.line();
+  o.line("   Bar: artwork works - switch it on.");
+  o.line("   Letters or numbers: keep artwork off.");
+  o.line();
+  o.line("2. Odd characters at the very top mean");
+  o.line("   this head ignores the darker burn.");
+  o.line();
+  o.line("Bold and double-struck: THIS LINE");
+  o.strike(false); o.bold(false);
+  o.line("Plain, for comparison: THIS LINE");
+  o.bold(true); o.strike(true);
+}
+
+/**
+ * ESC/POS for one slip. Everything is bold and double-struck (ESC E, ESC G) —
+ * the owner's bills came out thin. With `art` on (the office switches it on
+ * once the till has printed the test slip cleanly) the bill opens with the
+ * artwork header and the job asks the head for a darker burn (GS ( K); off,
+ * the name prints in the head's own big type and nothing is sent that a
+ * plain head could mistake for text. The rest is font A, 42 columns, laid
+ * out like the old till's slip. Size and emphasis are reset before the cut.
  * @param {Slip} slip
+ * @param {{ art?: boolean }} [opts]
  * @returns {Uint8Array}
  */
-function escposBytes(slip) {
+function escposBytes(slip, opts = {}) {
+  const art = !!opts.art || slip.to === "test";
   const o = writer();
   o.raw(ESC, 0x40); // reset
-  o.dark();         // burn darker for this job — the owner's heads print thin at their default
+  if (art) o.dark(); // burn darker for this job
   o.bold(true);
   o.strike(true);
-  if (slip.to === "bill") bill(o, slip);
+  if (slip.to === "bill") bill(o, slip, art);
+  else if (slip.to === "test") testSlip(o);
   else copy(o, slip);
   o.size(0);
   o.strike(false);
@@ -199,6 +245,6 @@ const sample = (now = new Date()) => ({
 });
 
 /** The agent version the app was released with; Setup warns a till running an older one. */
-const AGENT_LATEST = "1.4.0";
+const AGENT_LATEST = "1.4.1";
 
 module.exports = { escposBytes, BUSINESS, WIDTH, ascii, money, slipDate, slipTime, sample, AGENT_LATEST };
