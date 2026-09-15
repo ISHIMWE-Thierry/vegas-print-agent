@@ -297,6 +297,6 @@ const sample = (now = new Date()) => ({
 });
 
 /** The agent version the app was released with; Setup warns a till running an older one. */
-const AGENT_LATEST = "1.5.0";
+const AGENT_LATEST = "1.5.1";
 
 module.exports = { escposBytes, slipPage, pageText, BUSINESS, WIDTH, ascii, money, slipDate, slipTime, sample, AGENT_LATEST };

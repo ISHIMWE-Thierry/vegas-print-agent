@@ -49,7 +49,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -154,26 +154,67 @@ $written = 0
 [void][VegasPrint.Raw]::ClosePrinter($h)
 `;
 
-  ps(script, (err) => {
-    if (!err) {
-      fs.unlink(file, () => {});
-      return cb(null, "raw");
-    }
-    // A driver that refuses RAW should not mean no paper. Same slip, plain text:
-    // no big type, no artwork and no auto-cut, but the barman still has
-    // something to pour from — and never a metre of picture bytes as letters.
-    const text = stripEscPos(fs.readFileSync(file));
-    const txtFile = file + ".txt";
-    fs.writeFileSync(txtFile, text, "latin1");
-    ps(
-      `Get-Content -LiteralPath '${txtFile.replace(/'/g, "''")}' | Out-Printer -Name '${printer.replace(/'/g, "''")}'`,
-      (err2) => {
-        fs.unlink(file, () => {});
-        fs.unlink(txtFile, () => {});
-        cb(err2 || null, err2 ? undefined : "text");
-      },
-    );
+  ps(script, (err, _out, stderr) => {
+    fs.unlink(file, () => {});
+    if (!err) return cb(null, "raw");
+    cb(new Error(String(stderr || err).trim().slice(0, 300)));
   });
+}
+
+/**
+ * The last resort: the same slip as plain text through the driver's own
+ * text printing — no big type, no artwork, no cut, the driver's font and
+ * wrapping. Paper comes out, and nothing a plain head could mistake for text.
+ */
+function printText(printer, bytes, done) {
+  inFlight += 1;
+  const cb = (err, how) => { inFlight = Math.max(0, inFlight - 1); done(err, how); };
+  const txtFile = path.join(os.tmpdir(), `vegas-${Date.now()}.txt`);
+  fs.writeFileSync(txtFile, stripEscPos(bytes), "latin1");
+  if (!isWindows) {
+    execFile("lp", ["-d", printer, txtFile], (err) => { fs.unlink(txtFile, () => {}); cb(err, "text"); });
+    return;
+  }
+  ps(
+    `Get-Content -LiteralPath '${txtFile.replace(/'/g, "''")}' | Out-Printer -Name '${printer.replace(/'/g, "''")}'`,
+    (err, _out, stderr) => {
+      fs.unlink(txtFile, () => {});
+      cb(err ? new Error(String(stderr || err).trim().slice(0, 300)) : null, err ? undefined : "text");
+    },
+  );
+}
+
+/**
+ * One slip, whichever way this printer takes it. Printer codes first (or the
+ * page first when the house asked for pages), then the page through the
+ * driver, then plain text. A way a printer refused is remembered so the next
+ * slip does not wait on it again, and the reason travels with the job and in
+ * the heartbeat, so the office can see why a till prints the way it does.
+ */
+const refused = {};
+let lastHow = "";
+function printSlip(printer, { bytes, ops, mode }, done) {
+  const tries = [];
+  const canPage = isWindows && Array.isArray(ops) && ops.length > 0;
+  const rawOk = !(refused[printer] && refused[printer].raw);
+  const raw = ["raw", (cb) => printRaw(printer, bytes, cb)];
+  const page = ["page", (cb) => printPage(printer, ops, cb)];
+  if (mode === "page") { if (canPage) tries.push(page); if (rawOk) tries.push(raw); }
+  else { if (rawOk) tries.push(raw); if (canPage) tries.push(page); }
+  tries.push(["text", (cb) => printText(printer, bytes, cb)]);
+  const why = [];
+  const next = (i) => {
+    if (i >= tries.length) return done(new Error(why.join(" | ") || "nothing could print"));
+    const [how, fn] = tries[i];
+    fn((err) => {
+      if (!err) { lastHow = how; return done(null, how, why.join(" | ")); }
+      const reason = String(err).slice(0, 200);
+      why.push(`${how}: ${reason}`);
+      if (how === "raw") { refused[printer] = { ...(refused[printer] || {}), raw: reason }; log(`printer codes refused on ${printer}: ${reason}`); }
+      next(i + 1);
+    });
+  };
+  next(0);
 }
 
 /**
@@ -184,8 +225,8 @@ $written = 0
  * blank feed. If anything in this path fails, the same slip goes out raw, so
  * the bar is never without paper.
  */
-function printPage(printer, ops, rawBytes, done) {
-  if (!isWindows) return printRaw(printer, rawBytes, done);
+function printPage(printer, ops, done) {
+  if (!isWindows) return done(new Error("pages print through the Windows driver only"));
   inFlight += 1;
   const cb = (err, how) => { inFlight = Math.max(0, inFlight - 1); done(err, how); };
   const file = path.join(os.tmpdir(), `vegas-${Date.now()}.slip`);
@@ -250,12 +291,10 @@ $doc.add_PrintPage({
 })
 $doc.Print()
 `;
-  ps(script, (err) => {
+  ps(script, (err, _out, stderr) => {
     fs.unlink(file, () => {});
     if (!err) return cb(null, "page");
-    log("page print failed, printing raw instead:", String(err).slice(0, 200));
-    inFlight = Math.max(0, inFlight - 1);
-    printRaw(printer, rawBytes, done);
+    cb(new Error(String(stderr || err).trim().slice(0, 300)));
   });
 }
 
@@ -334,11 +373,10 @@ function serve() {
         const testing = url.searchParams.get("test") === "1";
         const slipObj = testing ? { to: "test", lines: [], total: 0 } : sample();
         const slip = Buffer.from(escposBytes(slipObj, { art }));
-        const answer = (err, how) =>
-          err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how });
-        // ?page=1 prints it through the Windows driver, as a page.
-        if (url.searchParams.get("page") === "1") return printPage(printer, slipPage(slipObj).ops, slip, answer);
-        return printRaw(printer, slip, answer);
+        const answer = (err, how, why) =>
+          err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how, why: why || "" });
+        // ?page=1 asks for the page through the Windows driver first.
+        return printSlip(printer, { bytes: slip, ops: slipPage(slipObj).ops, mode: url.searchParams.get("page") === "1" ? "page" : "raw" }, answer);
       }
 
       /* The office picks printers in the app; this is where that lands, so there
@@ -373,13 +411,12 @@ function serve() {
           const bytes = job.base64
             ? Buffer.from(job.base64, "base64")
             : render(job);
-          const answer = (err, how) =>
+          const answer = (err, how, why) =>
             err
               ? reply(res, 500, { ok: false, printer, error: String(err).slice(0, 300) })
-              : reply(res, 200, { ok: true, printer, how });
-          // "page": through the Windows driver, laid out here from the slip's own fields.
-          if (job.mode === "page" && Array.isArray(job.lines)) return printPage(printer, slipPage(job).ops, bytes, answer);
-          printRaw(printer, bytes, answer);
+              : reply(res, 200, { ok: true, printer, how, why: why || "" });
+          // The slip's own fields let the page be laid out here when the driver has to draw it.
+          printSlip(printer, { bytes, ops: Array.isArray(job.lines) ? slipPage(job).ops : null, mode: job.mode === "page" ? "page" : "raw" }, answer);
         });
         return;
       }
@@ -543,6 +580,8 @@ function start() {
           printers: names.slice(0, 20),
           mapped: PRINTERS,
           pid: process.pid,
+          howLast: lastHow,
+          rawError: Object.keys(refused).map((p) => `${p}: ${refused[p].raw}`).join(" · "),
         })
         .catch((e) => log("heartbeat failed:", String(e).slice(0, 120)));
     });
@@ -598,10 +637,8 @@ async function handle(key, job) {
   const bytes = typeof job.data.base64 === "string" && job.data.base64
     ? Buffer.from(job.data.base64, "base64")
     : render(job.data);
-  const out = job.data.mode === "page" && Array.isArray(job.data.lines)
-    ? (cb) => printPage(printer, slipPage(job.data).ops, bytes, cb)
-    : (cb) => printRaw(printer, bytes, cb);
-  out(async (err, how) => {
+  const ops = Array.isArray(job.data.lines) ? slipPage(job.data).ops : null;
+  printSlip(printer, { bytes, ops, mode: job.data.mode === "page" ? "page" : "raw" }, async (err, how, why) => {
     try {
       if (err) {
         const done = attempts >= MAX_ATTEMPTS;
@@ -613,8 +650,8 @@ async function handle(key, job) {
         });
         return;
       }
-      log(`printed ${job.data.title || job.data.to} on ${printer} (${how})`);
-      await fs2.patch(key, "printJobs", job.id, { status: "printed", how, printedAt: Date.now() });
+      log(`printed ${job.data.title || job.data.to} on ${printer} (${how})${why ? ` after ${why}` : ""}`);
+      await fs2.patch(key, "printJobs", job.id, { status: "printed", how, why: why || "", printedAt: Date.now() });
     } catch (e) {
       log("could not record the outcome:", String(e).slice(0, 160));
     }
