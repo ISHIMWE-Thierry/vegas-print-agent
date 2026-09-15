@@ -81,6 +81,14 @@ const slipDate = (d = new Date()) => `${d.getDate()}/${d.getMonth() + 1}/${d.get
 /** 17:32 */
 const slipTime = (d = new Date()) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 
+/** A black bar, 576 x 16 dots: the smallest artwork that shows whether a head takes rasters. */
+var TEST_BAR = (() => {
+  const rows = 16, perRow = 72;
+  const b = [GS, 0x76, 0x30, 0x00, perRow & 0xff, perRow >> 8, rows & 0xff, rows >> 8];
+  for (let i = 0; i < rows * perRow; i++) b.push(0xff);
+  return b;
+})();
+
 function writer() {
   /** @type {number[]} */
   const bytes = [];
@@ -102,6 +110,32 @@ function writer() {
     /** Artwork (GS v 0 raster) from base64 — atob is in every browser and in node. */
     image: (b64) => { const bin = atob(b64); for (let i = 0; i < bin.length; i++) bytes.push(bin.charCodeAt(i)); },
     rule: (ch = "-") => line(ch.repeat(WIDTH)),
+    /** The black bar of the test slip. */
+    bar: () => raw(...TEST_BAR),
+  };
+}
+
+/**
+ * The same slip as a list of drawing steps instead of printer bytes — for a
+ * till that prints through its Windows driver, like a document: each step is
+ * a line of text with its size and alignment, a rule, the header, or the
+ * test bar. The layout functions below do not know which writer they get.
+ */
+function pageWriter() {
+  /** @type {{ k: "line" | "rule" | "logo" | "bar"; s?: string; size?: number; centre?: boolean }[]} */
+  const ops = [];
+  let centre = false, size = 0;
+  return {
+    ops,
+    raw: () => {},
+    line: (s = "") => { ops.push({ k: "line", s: ascii(s), size, centre }); },
+    centre: () => { centre = true; },
+    left: () => { centre = false; },
+    size: (n) => { size = n === 0x11 ? 2 : n === 0x01 ? 1 : 0; },
+    bold: () => {}, strike: () => {}, dark: () => {},
+    image: () => { ops.push({ k: "logo" }); },
+    rule: () => { ops.push({ k: "rule" }); },
+    bar: () => { ops.push({ k: "bar" }); },
   };
 }
 
@@ -173,13 +207,6 @@ function copy(o, s) {
   totalLine(o, s.total);
 }
 
-/** A black bar, 576 x 16 dots: the smallest artwork that shows whether a head takes rasters. */
-const TEST_BAR = (() => {
-  const rows = 16, perRow = 72;
-  const b = [GS, 0x76, 0x30, 0x00, perRow & 0xff, perRow >> 8, rows & 0xff, rows >> 8];
-  for (let i = 0; i < rows * perRow; i++) b.push(0xff);
-  return b;
-})();
 
 /**
  * The test slip the office prints from Setup before switching artwork on. It
@@ -193,7 +220,7 @@ function testSlip(o) {
   o.line();
   o.left();
   o.line("1. A black bar should print here:");
-  o.raw(...TEST_BAR);
+  o.bar();
   o.line();
   o.line("   Bar: artwork works - switch it on.");
   o.line("   Letters or numbers: keep artwork off.");
@@ -237,6 +264,31 @@ function escposBytes(slip, opts = {}) {
   return Uint8Array.from(o.bytes);
 }
 
+/**
+ * The same slip as drawing steps, for a till printing through its Windows
+ * driver ("as a page"). The bill's header is always the name in big type
+ * there — the driver draws fonts itself, no raster needed.
+ * @param {Slip} slip
+ * @returns {{ ops: { k: "line" | "rule" | "logo" | "bar"; s?: string; size?: number; centre?: boolean }[] }}
+ */
+function slipPage(slip) {
+  const o = pageWriter();
+  if (slip.to === "bill") bill(o, slip, false);
+  else if (slip.to === "test") testSlip(o);
+  else copy(o, slip);
+  return { ops: o.ops };
+}
+
+/**
+ * The drawing steps as one line each, for the till's PowerShell to read:
+ * "L|0|text" / "C|2|VEGAS MOTEL" (alignment, size, text), "R" a rule,
+ * "X" the test bar, "G" the header artwork.
+ * @param {{ k: string; s?: string; size?: number; centre?: boolean }[]} ops
+ */
+function pageText(ops) {
+  return ops.map((op) => (op.k === "line" ? `${op.centre ? "C" : "L"}|${op.size || 0}|${op.s || ""}` : op.k === "rule" ? "R" : op.k === "bar" ? "X" : "G")).join("\r\n") + "\r\n";
+}
+
 /** A bill with the numbers from the owner's sample — what /selftest prints. */
 const sample = (now = new Date()) => ({
   to: "bill", venue: "bar", who: "Synthia", table: "6", at: slipTime(now), date: slipDate(now),
@@ -245,6 +297,6 @@ const sample = (now = new Date()) => ({
 });
 
 /** The agent version the app was released with; Setup warns a till running an older one. */
-const AGENT_LATEST = "1.4.1";
+const AGENT_LATEST = "1.5.0";
 
-module.exports = { escposBytes, BUSINESS, WIDTH, ascii, money, slipDate, slipTime, sample, AGENT_LATEST };
+module.exports = { escposBytes, slipPage, pageText, BUSINESS, WIDTH, ascii, money, slipDate, slipTime, sample, AGENT_LATEST };

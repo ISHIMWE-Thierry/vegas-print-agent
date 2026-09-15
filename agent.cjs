@@ -49,7 +49,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.4.1";
+const VERSION = "1.5.0";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -176,9 +176,92 @@ $written = 0
   });
 }
 
+/**
+ * Prints a slip as a page through the Windows printer driver — the way the
+ * old till's program did — instead of raw printer codes. The driver draws
+ * the fonts and cuts after the page, so what comes out is what the layout
+ * says, on any head the driver knows. A custom paper height means no metre of
+ * blank feed. If anything in this path fails, the same slip goes out raw, so
+ * the bar is never without paper.
+ */
+function printPage(printer, ops, rawBytes, done) {
+  if (!isWindows) return printRaw(printer, rawBytes, done);
+  inFlight += 1;
+  const cb = (err, how) => { inFlight = Math.max(0, inFlight - 1); done(err, how); };
+  const file = path.join(os.tmpdir(), `vegas-${Date.now()}.slip`);
+  fs.writeFileSync(file, pageText(ops), "utf8");
+  const q = (x) => String(x).replace(/'/g, "''");
+  const script = `
+$ErrorActionPreference='Stop'
+Add-Type -AssemblyName System.Drawing
+$ops = [System.IO.File]::ReadAllLines('${q(file)}')
+$doc = New-Object System.Drawing.Printing.PrintDocument
+$doc.PrinterSettings.PrinterName = '${q(printer)}'
+if (-not $doc.PrinterSettings.IsValid) { throw 'printer not valid: ${q(printer)}' }
+$doc.DocumentName = 'Vegas slip'
+$doc.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0)
+$W = 283
+$fMono = New-Object System.Drawing.Font('Consolas', 8.5, [System.Drawing.FontStyle]::Bold)
+$fMid = New-Object System.Drawing.Font('Arial', 11, [System.Drawing.FontStyle]::Bold)
+$fBig = New-Object System.Drawing.Font('Arial', 16, [System.Drawing.FontStyle]::Bold)
+$H = @{ '0' = 14; '1' = 19; '2' = 27 }
+$height = 30
+foreach ($op in $ops) {
+  if ($op.Length -eq 0) { continue }
+  $k = $op.Substring(0, 1)
+  if ($k -eq 'R') { $height += 12 } elseif ($k -eq 'X') { $height += 14 } elseif ($k -eq 'G') { $height += 52 } else { $height += $H[$op.Substring(2, 1)] }
+}
+$height += 40
+$doc.DefaultPageSettings.PaperSize = New-Object System.Drawing.Printing.PaperSize('Vegas slip', 315, $height)
+$script:y = 12
+$doc.add_PrintPage({
+  param($sender, $e)
+  $g = $e.Graphics
+  $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::SingleBitPerPixelGridFit
+  $black = [System.Drawing.Brushes]::Black
+  $fmtL = New-Object System.Drawing.StringFormat
+  $fmtL.Alignment = [System.Drawing.StringAlignment]::Near
+  $fmtL.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+  $fmtC = New-Object System.Drawing.StringFormat
+  $fmtC.Alignment = [System.Drawing.StringAlignment]::Center
+  $fmtC.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+  foreach ($op in $ops) {
+    if ($op.Length -eq 0) { continue }
+    $k = $op.Substring(0, 1)
+    if ($k -eq 'R') { $g.FillRectangle($black, 0, $script:y + 5, $W, 2); $script:y += 12; continue }
+    if ($k -eq 'X') { $g.FillRectangle($black, 0, $script:y + 2, $W, 10); $script:y += 14; continue }
+    if ($k -eq 'G') {
+      $g.DrawString('VEGAS MOTEL', $fBig, $black, (New-Object System.Drawing.RectangleF(0, $script:y, $W, 27)), $fmtC)
+      $g.DrawString('BAR & RESTAURANT', $fMid, $black, (New-Object System.Drawing.RectangleF(0, ($script:y + 29), $W, 19)), $fmtC)
+      $script:y += 52
+      continue
+    }
+    $size = $op.Substring(2, 1)
+    $text = ''
+    if ($op.Length -gt 4) { $text = $op.Substring(4) }
+    $font = $fMono
+    if ($size -eq '1') { $font = $fMid } elseif ($size -eq '2') { $font = $fBig }
+    $fmt = $fmtL
+    if ($k -eq 'C') { $fmt = $fmtC }
+    $g.DrawString($text, $font, $black, (New-Object System.Drawing.RectangleF(0, $script:y, $W, $H[$size])), $fmt)
+    $script:y += $H[$size]
+  }
+  $e.HasMorePages = $false
+})
+$doc.Print()
+`;
+  ps(script, (err) => {
+    fs.unlink(file, () => {});
+    if (!err) return cb(null, "page");
+    log("page print failed, printing raw instead:", String(err).slice(0, 200));
+    inFlight = Math.max(0, inFlight - 1);
+    printRaw(printer, rawBytes, done);
+  });
+}
+
 /* ------------------------------------------------------------------- the slip */
 
-const { escposBytes, sample } = require("./slipLayout.cjs");
+const { escposBytes, slipPage, pageText, sample } = require("./slipLayout.cjs");
 
 /**
  * Lays a job out as ESC/POS. The layout is slipLayout.cjs, the same file the
@@ -248,12 +331,14 @@ function serve() {
         // The owner's sample bill, so what comes out is what a real bill looks like.
         // ?art=1 adds the artwork header and the darker burn; ?test=1 prints the test slip.
         const art = url.searchParams.get("art") === "1";
-        const slip = url.searchParams.get("test") === "1"
-          ? Buffer.from(escposBytes({ to: "test", lines: [], total: 0 }))
-          : Buffer.from(escposBytes(sample(), { art }));
-        return printRaw(printer, slip, (err, how) =>
-          err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how }),
-        );
+        const testing = url.searchParams.get("test") === "1";
+        const slipObj = testing ? { to: "test", lines: [], total: 0 } : sample();
+        const slip = Buffer.from(escposBytes(slipObj, { art }));
+        const answer = (err, how) =>
+          err ? reply(res, 500, { ok: false, error: String(err).slice(0, 300) }) : reply(res, 200, { ok: true, how });
+        // ?page=1 prints it through the Windows driver, as a page.
+        if (url.searchParams.get("page") === "1") return printPage(printer, slipPage(slipObj).ops, slip, answer);
+        return printRaw(printer, slip, answer);
       }
 
       /* The office picks printers in the app; this is where that lands, so there
@@ -288,12 +373,13 @@ function serve() {
           const bytes = job.base64
             ? Buffer.from(job.base64, "base64")
             : render(job);
-
-          printRaw(printer, bytes, (err, how) =>
+          const answer = (err, how) =>
             err
               ? reply(res, 500, { ok: false, printer, error: String(err).slice(0, 300) })
-              : reply(res, 200, { ok: true, printer, how }),
-          );
+              : reply(res, 200, { ok: true, printer, how });
+          // "page": through the Windows driver, laid out here from the slip's own fields.
+          if (job.mode === "page" && Array.isArray(job.lines)) return printPage(printer, slipPage(job).ops, bytes, answer);
+          printRaw(printer, bytes, answer);
         });
         return;
       }
@@ -512,7 +598,10 @@ async function handle(key, job) {
   const bytes = typeof job.data.base64 === "string" && job.data.base64
     ? Buffer.from(job.data.base64, "base64")
     : render(job.data);
-  printRaw(printer, bytes, async (err, how) => {
+  const out = job.data.mode === "page" && Array.isArray(job.data.lines)
+    ? (cb) => printPage(printer, slipPage(job.data).ops, bytes, cb)
+    : (cb) => printRaw(printer, bytes, cb);
+  out(async (err, how) => {
     try {
       if (err) {
         const done = attempts >= MAX_ATTEMPTS;
