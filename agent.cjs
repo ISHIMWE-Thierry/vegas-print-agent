@@ -30,13 +30,26 @@ const KEY_FILE = path.join(HERE, "service-account.json");
 
 /** Which Windows printer each destination maps to. Set in config.json. */
 let PRINTERS = CONFIG.printers || { bar: "", kitchen: "", bill: "" };
+/** Which counters this till prints for: "bar", "club" or both. The bar's
+ *  till and the club's till each claim only their own slips; a kitchen slip
+ *  is claimed by whichever till has the kitchen printer. */
+let SERVES = Array.isArray(CONFIG.serves) && CONFIG.serves.length ? CONFIG.serves.map(String) : ["bar", "club"];
 
 /** Saves the printer choices beside the exe so they survive a restart. */
-function saveConfig(printers) {
+function saveConfig(printers, serves) {
   PRINTERS = { bar: "", kitchen: "", bill: "", ...printers };
-  const next = { ...CONFIG, printers: PRINTERS };
+  if (Array.isArray(serves) && serves.length) SERVES = serves.map(String).filter((v) => v === "bar" || v === "club");
+  if (!SERVES.length) SERVES = ["bar", "club"];
+  const next = { ...CONFIG, printers: PRINTERS, serves: SERVES };
   fs.writeFileSync(path.join(HERE, "config.json"), JSON.stringify(next, null, 2));
-  log(`Printers set from the app: ${JSON.stringify(PRINTERS)}`);
+  log(`Printers set from the app: ${JSON.stringify(PRINTERS)} · serves ${SERVES.join("+")}`);
+}
+/** Whether a queued slip is this till's to print. */
+function wantsJob(job) {
+  const to = job.to || "bill";
+  if (to === "kitchen") return !!PRINTERS.kitchen;
+  const venue = job.venue === "club" ? "club" : "bar";
+  return SERVES.includes(venue) && !!(PRINTERS[to] || PRINTERS.bill);
 }
 const PORT = CONFIG.port || 9110;
 /** Loopback by default — set "host": "0.0.0.0" in config.json to expose it. */
@@ -49,7 +62,7 @@ const KEEP_PRINTED = 24 * 60 * 60 * 1000;
 const RETRY_AFTER = 60 * 1000;
 const POLL_EVERY = 3000;
 /** Shown on the till's Setup page; bump with every release. */
-const VERSION = "1.5.1";
+const VERSION = "1.6.0";
 /** How often the agent tells the house it is alive (agents/<host>). */
 const HEARTBEAT_EVERY = 30 * 1000;
 
@@ -357,7 +370,7 @@ function serve() {
       if (req.method === "OPTIONS") return reply(res, 204, {});
 
       if (url.pathname === "/") {
-        return reply(res, 200, { ok: true, service: "vegas-print-agent", version: VERSION, platform: process.platform, printers: PRINTERS });
+        return reply(res, 200, { ok: true, service: "vegas-print-agent", version: VERSION, platform: process.platform, printers: PRINTERS, serves: SERVES });
       }
 
       if (url.pathname === "/printers") {
@@ -386,10 +399,10 @@ function serve() {
         req.on("data", (c) => { body += c; if (body.length > 1e5) req.destroy(); });
         req.on("end", () => {
           try {
-            const { printers } = JSON.parse(body);
+            const { printers, serves } = JSON.parse(body);
             if (!printers || typeof printers !== "object") throw new Error("printers required");
-            saveConfig(printers);
-            reply(res, 200, { ok: true, printers: PRINTERS });
+            saveConfig(printers, serves);
+            reply(res, 200, { ok: true, printers: PRINTERS, serves: SERVES });
           } catch (e) {
             reply(res, 400, { ok: false, error: String(e).slice(0, 200) });
           }
@@ -579,6 +592,7 @@ function start() {
           lastSeen: new Date().toISOString(),
           printers: names.slice(0, 20),
           mapped: PRINTERS,
+          serves: SERVES,
           pid: process.pid,
           howLast: lastHow,
           rawError: Object.keys(refused).map((p) => `${p}: ${refused[p].raw}`).join(" · "),
@@ -592,7 +606,8 @@ function start() {
   const tick = async () => {
     try {
       const jobs = await fs2.where(key, "printJobs", "status", "queued");
-      for (const job of jobs) await handle(key, job);
+      // Only this counter's slips (and the kitchen's, if the kitchen printer is here); the other till takes the rest.
+      for (const job of jobs.filter((j) => wantsJob(j.data))) await handle(key, job);
     } catch (e) {
       log("queue check failed:", String(e).slice(0, 160));
     }
